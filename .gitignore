@@ -23,3 +23,9 @@ missing
 src/.deps/
 src/.dirstamp
 src/.libs/
+
+# meson build output, wheels
+build/
+dist/
+wheelhouse/
+__pycache__/

@@ -4,14 +4,17 @@
 #include <cstdlib>
 #include <cstring>
 
+#if !defined(SMOOTHUV_NO_SIMD) && (defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2))
+#define SMOOTHUV_SSE2 1
 #include <emmintrin.h>
+#endif
 
-#include <VapourSynth.h>
-#include <VSHelper.h>
+#include <VapourSynth4.h>
+#include <VSHelper4.h>
 
 
 typedef struct SmoothUVData {
-    VSNodeRef *clip;
+    VSNode *clip;
     const VSVideoInfo *vi;
 
     int radius;
@@ -23,12 +26,44 @@ typedef struct SmoothUVData {
 } SmoothUVData;
 
 
-static inline void sum_pixels_SSE2(const uint8_t *srcp, uint8_t *dstp, const int stride,
+// One output pixel: the same arithmetic as one 16 bit lane of the SSE2 code.
+static inline uint8_t sum_pixel(const uint8_t *srcp, int center, const int stride,
+                                const int x_first, const int x_count, const int height,
+                                const int thres, const uint16_t *divinp) {
+    unsigned sum = 0;
+    unsigned count = 0;
+
+    for (int y = 0; y < height; y++) {
+        for (int x = x_first; x < x_first + x_count; x++) {
+            int neighbour = srcp[x];
+            int abs_diff = std::abs(center - neighbour);
+
+            if (thres > abs_diff) {
+                sum = std::min(sum + neighbour, 65535u);
+                count++;
+            }
+        }
+
+        srcp += stride;
+    }
+
+    sum = std::min(sum + ((count & 0xFFFF) >> 1), 65535u);
+
+    unsigned value = (sum * divinp[count & 0xFF]) >> 16;
+    int16_t packed = (int16_t)value;
+
+    return (uint8_t)std::min(std::max((int)packed, 0), 255);
+}
+
+
+#ifdef SMOOTHUV_SSE2
+static inline void sum_pixels(const uint8_t *srcp, uint8_t *dstp, const int stride,
                     const int diff, const int width, const int height,
-                    const __m128i &thres,
+                    const int threshold,
                     const uint16_t *divinp) {
 
     __m128i zeroes = _mm_setzero_si128();
+    const __m128i thres = _mm_set1_epi16(threshold);
 
     __m128i sum = zeroes;
     __m128i count = zeroes;
@@ -63,26 +98,66 @@ static inline void sum_pixels_SSE2(const uint8_t *srcp, uint8_t *dstp, const int
     sum = _mm_adds_epu16(sum,
                          _mm_srli_epi16(count, 1));
 
-    __m128i divres = zeroes;
+    alignas(16) uint16_t counts[8];
+    alignas(16) uint16_t divisors[8];
+    _mm_store_si128((__m128i *)counts, count);
 
-    for (int i = 0; i < 8; i++) {
-        int e = _mm_extract_epi16(count, i);
-        divres = _mm_insert_epi16(divres, divinp[e], i);
-    }
+    for (int i = 0; i < 8; i++)
+        divisors[i] = divinp[counts[i]];
+
+    __m128i divres = _mm_load_si128((const __m128i *)divisors);
 
     // Now multiply (divres/65536)
     sum = _mm_mulhi_epu16(sum, divres);
     sum = _mm_packus_epi16(sum, sum);
     _mm_storel_epi64((__m128i *)dstp, sum);
 }
+#else
+// Eight pixels like the SSE2 code, lane by lane.
+static inline void sum_pixels(const uint8_t *srcp, uint8_t *dstp, const int stride,
+                    const int diff, const int width, const int height,
+                    const int threshold,
+                    const uint16_t *divinp) {
+    for (int i = 0; i < 8; i++)
+        dstp[i] = sum_pixel(srcp - diff + i, srcp[i], stride, 0, width, height, threshold, divinp);
+}
+#endif
+
+
+// Processes eight pixels starting at column x; a block reaching past the last column is done pixel by pixel.
+static inline void smooth_block(const uint8_t *srcp, uint8_t *dstp, int stride, int w,
+                                int x, int radius, int offset, int yn,
+                                int thres, const uint16_t *divin) {
+    if (x + 8 > w) {
+        for (int px = x; px < w; px++) {
+            int first = std::min(px, radius);
+            int last = std::min(px + radius, w - 1);
+            dstp[px] = sum_pixel(srcp + px - offset, srcp[px], stride,
+                                 -first, last - px + first + 1, yn, thres, divin);
+        }
+        return;
+    }
+
+    int x0 = (x < radius) ? x : radius;
+
+    int xn = (x + 7 + radius < w - 1) ? x0 + radius + 1
+                                      : x0 + w - x - 7;
+
+    sum_pixels(srcp + x, dstp + x,
+               stride,
+               offset + x0,
+               xn, yn,
+               thres,
+               divin);
+}
 
 
 template <bool interlaced>
-static void smoothN_SSE2(int radius,
-                         const uint8_t* origsrc, uint8_t* origdst,
-                         int stride, int w, int h,
-                         const int threshold,
-                         const uint16_t* divin) {
+static void smoothN(int radius,
+                    const uint8_t* origsrc, uint8_t* origdst,
+                    int stride, int w, int h,
+                    const int threshold,
+                    const uint16_t* divin) {
     const uint8_t *srcp = origsrc;
     const uint8_t *srcp2 = origsrc + stride;
     uint8_t *dstp = origdst;
@@ -90,7 +165,11 @@ static void smoothN_SSE2(int radius,
 
     const int SqrtTsquared = (int)sqrt((threshold * threshold) / 3);
 
-    const __m128i thres = _mm_set1_epi16(SqrtTsquared);
+    // Below threshold 2 no pixel, not even the centre, passes the comparison: nothing to smooth.
+    if (SqrtTsquared == 0) {
+        vsh::bitblt(origdst, stride, origsrc, stride, w, h);
+        return;
+    }
 
     int h2 = h;
 
@@ -111,26 +190,10 @@ static void smoothN_SSE2(int radius,
         int offset = y0 * stride;
 
         for (int x = 0; x < w; x += 8) {
-            int x0 = (x < radius) ? x : radius;
+            smooth_block(srcp, dstp, stride, w, x, radius, offset, yn, SqrtTsquared, divin);
 
-            int xn = (x + 7 + radius < w - 1) ? x0 + radius + 1
-                                              : x0 + w - x - 7;
-
-            sum_pixels_SSE2(srcp + x, dstp + x,
-                            stride,
-                            offset + x0,
-                            xn, yn,
-                            thres,
-                            divin);
-
-            if (interlaced) {
-                sum_pixels_SSE2(srcp2 + x, dstp2 + x,
-                                stride,
-                                offset + x0,
-                                xn, yn,
-                                thres,
-                                divin);
-            }
+            if (interlaced)
+                smooth_block(srcp2, dstp2, stride, w, x, radius, offset, yn, SqrtTsquared, divin);
         }
 
         dstp += stride;
@@ -139,61 +202,40 @@ static void smoothN_SSE2(int radius,
         srcp2 += stride;
     }
 
-    if (interlaced && h % 1) {
+    // Odd plane height (4:2:0 chroma of e.g. 486 lines): the last line belongs to the first field.
+    if (interlaced && h % 2) {
         int yn = radius;
 
         int offset = radius * stride;
 
-        for (int x = 0; x < w; x += 8) {
-            int x0 = (x < radius) ? x : radius;
-
-            int xn = (x + 7 + radius < w - 1) ? x0 + radius + 1
-                                              : x0 + w - x - 7;
-
-            sum_pixels_SSE2(srcp + x, dstp + x,
-                            stride,
-                            offset + x0,
-                            xn, yn,
-                            thres,
-                            divin);
-        }
+        for (int x = 0; x < w; x += 8)
+            smooth_block(srcp, dstp, stride, w, x, radius, offset, yn, SqrtTsquared, divin);
     }
 }
 
 
-static void VS_CC smoothUVInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
-    (void)in;
-    (void)out;
-    (void)core;
-
-    SmoothUVData *d = (SmoothUVData *) *instanceData;
-
-    vsapi->setVideoInfo(d->vi, 1, node);
-}
-
-
-static const VSFrameRef *VS_CC smoothUVGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+static const VSFrame *VS_CC smoothUVGetFrame(int n, int activationReason, void *instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
     (void)frameData;
 
-    const SmoothUVData *d = (const SmoothUVData *) *instanceData;
+    const SmoothUVData *d = (const SmoothUVData *)instanceData;
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->clip, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        const VSFrameRef *src = vsapi->getFrameFilter(n, d->clip, frameCtx);
+        const VSFrame *src = vsapi->getFrameFilter(n, d->clip, frameCtx);
 
         int width = vsapi->getFrameWidth(src, 0);
         int height = vsapi->getFrameHeight(src, 0);
 
         // Reuse the luma plane, allocate memory for the chroma planes.
-        const VSFrameRef *plane_src[3] = { src, nullptr, nullptr };
+        const VSFrame *plane_src[3] = { src, nullptr, nullptr };
         int planes[3] = { 0 };
 
-        VSFrameRef *dst = vsapi->newVideoFrame2(d->vi->format, width, height, plane_src, planes, src, core);
+        VSFrame *dst = vsapi->newVideoFrame2(&d->vi->format, width, height, plane_src, planes, src, core);
 
-        const VSMap *props = vsapi->getFramePropsRO(src);
+        const VSMap *props = vsapi->getFramePropertiesRO(src);
         int err;
-        int64_t field_based = vsapi->propGetInt(props, "_FieldBased", 0, &err);
+        int64_t field_based = vsapi->mapGetInt(props, "_FieldBased", 0, &err);
 
         bool interlaced = field_based == 1 || field_based == 2;
         if (d->interlaced_exists)
@@ -203,12 +245,12 @@ static const VSFrameRef *VS_CC smoothUVGetFrame(int n, int activationReason, voi
             const uint8_t *srcp = vsapi->getReadPtr(src, plane);
             uint8_t *dstp = vsapi->getWritePtr(dst, plane);
 
-            int stride = vsapi->getStride(src, plane);
+            ptrdiff_t stride = vsapi->getStride(src, plane);
             width = vsapi->getFrameWidth(src, plane);
             height = vsapi->getFrameHeight(src, plane);
 
-            (interlaced ? smoothN_SSE2<true>
-                        : smoothN_SSE2<false>)(d->radius, srcp, dstp, stride, width, height, d->threshold, d->divin);
+            (interlaced ? smoothN<true>
+                        : smoothN<false>)(d->radius, srcp, dstp, (int)stride, width, height, d->threshold, d->divin);
         }
 
         vsapi->freeFrame(src);
@@ -239,36 +281,37 @@ static void VS_CC smoothUVCreate(const VSMap *in, VSMap *out, void *userData, VS
 
     int err;
 
-    d.radius = int64ToIntS(vsapi->propGetInt(in, "radius", 0, &err));
+    d.radius = vsh::int64ToIntS(vsapi->mapGetInt(in, "radius", 0, &err));
     if (err)
         d.radius = 3;
 
-    d.threshold = int64ToIntS(vsapi->propGetInt(in, "threshold", 0, &err));
+    d.threshold = vsh::int64ToIntS(vsapi->mapGetInt(in, "threshold", 0, &err));
     if (err)
         d.threshold = 270;
 
-    d.interlaced = !!vsapi->propGetInt(in, "interlaced", 0, &err);
+    d.interlaced = !!vsapi->mapGetInt(in, "interlaced", 0, &err);
     d.interlaced_exists = !err;
 
 
     if (d.radius < 1 || d.radius > 7) {
-        vsapi->setError(out, "SmoothUV: radius must be between 1 and 7 (inclusive).");
+        vsapi->mapSetError(out, "SmoothUV: radius must be between 1 and 7 (inclusive).");
         return;
     }
 
     if (d.threshold < 0 || d.threshold > 450) {
-        vsapi->setError(out, "SmoothUV: threshold must be between 0 and 450 (inclusive).");
+        vsapi->mapSetError(out, "SmoothUV: threshold must be between 0 and 450 (inclusive).");
         return;
     }
 
 
-    d.clip = vsapi->propGetNode(in, "clip", 0, nullptr);
+    d.clip = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d.vi = vsapi->getVideoInfo(d.clip);
 
-    if (!d.vi->format ||
-        d.vi->format->bitsPerSample != 8 ||
-        d.vi->format->colorFamily != cmYUV) {
-        vsapi->setError(out, "SmoothUV: only 8 bit YUV with constant format supported.");
+    if (!vsh::isConstantVideoFormat(d.vi) ||
+        d.vi->format.sampleType != stInteger ||
+        d.vi->format.bitsPerSample != 8 ||
+        d.vi->format.colorFamily != cfYUV) {
+        vsapi->mapSetError(out, "SmoothUV: only 8 bit YUV with constant format supported.");
         vsapi->freeNode(d.clip);
         return;
     }
@@ -281,16 +324,18 @@ static void VS_CC smoothUVCreate(const VSMap *in, VSMap *out, void *userData, VS
     SmoothUVData *data = (SmoothUVData *)malloc(sizeof(SmoothUVData));
     *data = d;
 
-    vsapi->createFilter(in, out, "SmoothUV", smoothUVInit, smoothUVGetFrame, smoothUVFree, fmParallel, 0, data, core);
+    VSFilterDependency deps[] = { { data->clip, rpStrictSpatial } };
+    vsapi->createVideoFilter(out, "SmoothUV", data->vi, smoothUVGetFrame, smoothUVFree, fmParallel, deps, 1, data, core);
 }
 
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
-    configFunc("com.nodame.smoothuv", "smoothuv", "SmoothUV is a spatial derainbow filter", VAPOURSYNTH_API_VERSION, 1, plugin);
-    registerFunc("SmoothUV",
-                 "clip:clip;"
-                 "radius:int:opt;"
-                 "threshold:int:opt;"
-                 "interlaced:int:opt;"
-                 , smoothUVCreate, 0, plugin);
+VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
+    vspapi->configPlugin("com.nodame.smoothuv", "smoothuv", "SmoothUV is a spatial derainbow filter", VS_MAKE_VERSION(1, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->registerFunction("SmoothUV",
+                             "clip:vnode;"
+                             "radius:int:opt;"
+                             "threshold:int:opt;"
+                             "interlaced:int:opt;",
+                             "clip:vnode;",
+                             smoothUVCreate, nullptr, plugin);
 }

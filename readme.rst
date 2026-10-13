@@ -5,7 +5,11 @@ SmoothUV is a spatial derainbow filter.
 
 The luma is returned unchanged.
 
-Currently only x86 systems are supported.
+x86 uses SSE2, other CPUs (e.g. arm64) a scalar version with identical
+results.
+
+This fork uses the VapourSynth API 4 and builds wheels for Windows x64,
+Linux x86_64 and macOS arm64 (see `Fork changes`_).
 
 This is a port of the SmoothUV filter from the SmoothUV Avisynth
 plugin. The Avisynth plugin also includes the SSHiQ filter, which was
@@ -93,19 +97,33 @@ Compilation
 
 ::
 
-    mkdir build && cd build
-    meson ../
-    ninja
+    meson setup build
+    ninja -C build
 
-Or:
+Without VapourSynth headers on the system, the vendored API 4 headers in
+``include/vapoursynth`` are used.
 
-::
+Wheel (installs into ``site-packages/vapoursynth/plugins``)::
 
-    ./autogen.sh
-    ./configure
-    make
+    pip install .
 
-Meson runs faster than autogen.sh and configure.
+
+Fork changes
+============
+
+- VapourSynth API 4 (``VapourSynthPluginInit2``), plugin version 1.1.
+- Scalar code for CPUs without SSE2 (arm64), bit-identical to the SSE2 code.
+- Right edge: when the chroma width is no multiple of 8, the last columns
+  were averaged over a window left of the pixel or, if that window was
+  empty, set to 0 (e.g. width 852: the last two chroma columns). These
+  columns now use the window clamped at the image edge.
+- Interlaced with an odd chroma height (e.g. 4:2:0 with 486 lines): the
+  last chroma line was never written.
+- Threshold 0 or 1 let no pixel pass the comparison and set the chroma
+  to 0; the chroma is now returned unchanged.
+- Everywhere else the output is identical to the original plugin.
+- Meson build with meson-python wheels for Windows x64, Linux x86_64
+  and macOS arm64; the autotools build was removed.
 
 
 License
